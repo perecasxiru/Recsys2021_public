@@ -1,0 +1,558 @@
+#!/env/bin/python
+
+import os
+import pandas as pd
+import dask.dataframe as dd
+import lightgbm as lgb
+import numpy as np
+import string
+import json
+
+from sklearn.metrics import average_precision_score, log_loss
+from tqdm import tqdm
+from transformers import BertTokenizer
+
+
+import sys
+
+class Logger(object):
+    def __init__(self):
+        self.terminal = sys.stdout
+        self.log = open("logfile.log", "w")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.terminal.flush()
+        self.log.write(message)  
+
+    def flush(self):
+        #this flush method is needed for python 3 compatibility.
+        #this handles the flush command by doing nothing.
+        #you might want to specify some extra behavior here.
+        pass    
+
+sys.stdout = Logger()
+
+column_type={
+            'bert': str,'hashtags':str,'tweet_id':str,'media':str,'links':str,'domains':str,'type':str,'language':str,'timestamp':np.uint32,
+            'AUTH_user_id':str,'AUTH_follower_count':np.uint32,'AUTH_following_count':np.uint32,'AUTH_verified':bool,'AUTH_account_creation':np.uint32,
+            'READ_user_id':str,'READ_follower_count':np.uint32,'READ_following_count':np.uint32,'READ_verified':bool,'READ_account_creation':np.uint32,
+            'auth_follows_read':bool,
+             # 'reply_timestamp':'Int32','retweet_timestamp':'Int32','quote_timestamp':'Int32','like_timestamp':'Int32'
+             }
+
+def calculate_ctr(gt):
+    positive = len([x for x in gt if x == 1])
+    ctr = positive/float(len(gt))
+    return ctr
+
+def compute_rce(pred, gt):
+
+    cross_entropy = log_loss(gt, pred)
+    data_ctr = calculate_ctr(gt)
+    strawman_cross_entropy = log_loss(gt, [data_ctr for _ in range(len(gt))])
+    return (1.0 - cross_entropy/strawman_cross_entropy)*100.0
+
+
+def basic_features(df):
+
+    df['f01_num_hashtags'] = df.hashtags.str.split('\t').str.len().fillna(0).astype(np.uint8)
+    df['f02_AUTH_verified'] = df.AUTH_verified.astype(int).astype('category')
+    df['f03_READ_verified'] = df.READ_verified.astype(int).astype('category')
+    df['f04_auth_follows_read'] = df.auth_follows_read.astype(int).astype('category')
+    df['f05_bert_length'] = df.bert.str.split('\t').str.len().fillna(0).astype(np.uint16)
+    #df = df.drop(columns=['bert'])
+    df['f06_num_media'] = df.media.str.split('\t').str.len().fillna(0).astype(np.uint8)
+    df['f07_num_domains'] = df.domains.str.split('\t').str.len().fillna(0).astype(np.uint8)
+    df['f08_ratio1'] = df.AUTH_following_count/(df.READ_following_count+1e-6).astype(np.float32)
+    df['f09_ratio2'] = df.AUTH_following_count/(df.READ_follower_count+1e-6).astype(np.float32)
+    df['f10_ratio3'] = df.READ_following_count/(df.READ_follower_count+1e-6).astype(np.float32)
+    df['f11_ratio4'] = df.AUTH_follower_count/(df.READ_follower_count+1e-6).astype(np.float32)
+    df['f12_photo'] = df.media.str.count('Photo').fillna(0).astype(np.uint8)
+    df['f13_video'] = df.media.str.count('Video').fillna(0).astype(np.uint8)
+    df['f14_GIF'] = df.media.str.count('GIF').fillna(0).astype(np.uint8)
+    df['f15_type'] = df.type.astype('category')
+    df['f16_hour'] = df.timestamp.astype('M8[s]').dt.hour.astype('category')
+    df['f17_num_links'] = df.links.str.split('\t').str.len().fillna(0).astype(np.uint8)
+
+    dct_langs = {row['language']: i for i, row in pd.read_csv('language_counts.csv').iterrows() }
+    df['f18_language'] = df.language.replace(dct_langs).astype('category')
+    df['f19_weekday'] = df.timestamp.astype('M8[s]').dt.weekday.astype('category')
+    df['f20_auth_creat_year'] = df.AUTH_account_creation.astype('M8[s]').dt.year.apply(lambda x: 0 if x<0 else x, meta=(None, 'int')).astype(np.uint16)
+    df['f21_read_creat_year'] = df.READ_account_creation.astype('M8[s]').dt.year.apply(lambda x: 0 if x<0 else x, meta=(None, 'int')).astype(np.uint16)
+    df['f22_diff_creat_year'] = (df.AUTH_account_creation.astype('M8[s]').dt.year.apply(lambda x: 0 if x<0 else x, meta=(None, 'int')).astype(int) - df.READ_account_creation.astype('M8[s]').dt.year.apply(lambda x: 0 if x<0 else x, meta=(None, 'int'))).astype(np.int16)    
+    
+    df['f23_at_bert'] = df.bert.str.contains('\t137\t').astype(np.uint8)#.astype('category')            # At sign: @
+    df['f24_rt_at_bert'] = df.bert.str.contains('\t56898\t137\t').astype(np.uint8)#.astype('category')  # RT at sign: RT @
+    
+    df['f25_unk'] = df.bert.str.count('\t100\t').astype(np.uint8)
+    df['f26_unk_ratio'] = (df['f25_unk'] / df['f05_bert_length']).astype(np.float32)
+
+    return df
+
+
+def text_features(df):
+    df = pd.concat([df, df.bert.str.extract(r'^\d+\t(?P<f27_tok1>\d+)?\t(?P<f28_tok2>\d+)?\t.*\t(?P<f29_tok3>\d+)?\t(?P<f30_tok4>\d+)?\t\d+$').fillna(101)], axis=1)
+
+    df['f27_tok1'] = pd.Categorical(df['f27_tok1'].astype(int), categories=list(range(0,119548)))
+    df['f28_tok2'] = pd.Categorical(df['f28_tok2'].astype(int), categories=list(range(0,119548))) 
+    df['f29_tok3'] = pd.Categorical(df['f29_tok3'].astype(int), categories=list(range(0,119548))) 
+    df['f30_tok4'] = pd.Categorical(df['f30_tok4'].astype(int), categories=list(range(0,119548)))
+    
+    df['f31_question'] = df.bert.str.count('\t136\t').astype(np.uint8)
+
+    """
+    tqdm.pandas()
+    tokenizer = BertTokenizer.from_pretrained("twitter-tokenizer")
+    df['text'] = df.bert.progress_apply(lambda x: tokenizer.decode(x.split('\t')))
+    df['f31_num_words'] = df.text.progress_apply(lambda x: len(x.split()))
+    df['f32_num_unique_words'] = df.text.progress_apply(lambda x: len(set(x.split())))
+    df['f33_ratio_unique_words'] = df['f32_num_unique_words'] / df['f31_num_words']
+    df['f34_num_punct'] = df.text.progress_apply(lambda x: len([c for c in x if c in string.punctuation]))
+    df['f35_ratio_punct'] = df['f34_num_punct'] / df['f31_num_words']
+    df['f36_mean_word_len'] = df.text.progress_apply(lambda x: np.mean([len(w) for w in x.split()]))
+    df['f37_max_word_len'] = df.text.progress_apply(lambda x: np.max([len(w) for w in x.split()]))
+    df['f38_num_upper'] = df.text.progress_apply(lambda x: len([w for w in x.split() if w.isupper()]))
+    df['f39_ratio_upper'] = df['f38_num_upper'] / df['f31_num_words']
+    df['f40_num_title'] = df.text.progress_apply(lambda x: len([w for w in x.split() if w.istitle()]))
+    df['f41_ratio_title'] = df['f40_num_title'] / df['f31_num_words']
+    df['f42_unk_ratio_words'] =  (df['f25_unk'] / df['f31_num_words']).astype(np.float32)
+    
+    df = df.drop(columns=['bert', 'text'])
+    """
+
+    return df
+
+
+def merge_logcounts(df):
+
+    auth_count = pd.read_csv('AUTH_user_id_counts.csv')
+    read_count = pd.read_csv('READ_user_id_counts.csv')
+
+    auth_count['AUTH_user_id_counts'] = np.floor(np.log10(auth_count['AUTH_user_id_counts'])).astype(np.uint8)
+    read_count['READ_user_id_counts'] = np.floor(np.log10(read_count['READ_user_id_counts'])).astype(np.uint8)
+
+    df = df.reset_index(drop=True)
+    df['f25_auth_log_count'] = pd.merge(df[['AUTH_user_id']], auth_count, on='AUTH_user_id', how='left').fillna(0)[['AUTH_user_id_counts']]
+    df = df.reset_index(drop=True)
+    df['f26_read_log_count'] = pd.merge(df[['READ_user_id']], read_count, on='READ_user_id', how='left').fillna(0)[['READ_user_id_counts']]
+
+    del auth_count, read_count
+
+    return df
+
+def merge_popularity(df):
+    # AUTH popularity
+    auth_merge = pd.read_csv('auth_merge_div_counts.csv',
+                             dtype={'reply': np.float32, 'retweet': np.float32, 
+                                    'quote': np.float32, 'like': np.float32})
+    auth_merge = auth_merge.rename(columns={'reply': 'avg_reply', 'retweet': 'avg_retweet', 
+                                             'quote': 'avg_quote', 'like': 'avg_like'})
+    df = df.reset_index(drop=True)
+
+    _cols = ['avg_reply', 'avg_retweet', 'avg_quote', 'avg_like', 'AUTH_count_user_id']
+    df[_cols] = pd.merge(df[['AUTH_user_id']], auth_merge, on='AUTH_user_id', how='left').fillna(0)[_cols]
+
+    del auth_merge
+
+    print('Auth done')
+
+    # READ popularity
+    read_merge = pd.read_csv('read_merge_div_counts.csv',
+                             dtype={'reply': np.float32, 'retweet': np.float32, 
+                                    'quote': np.float32, 'like': np.float32})
+    read_merge = read_merge.rename(columns={'reply': 'avg_reply_read', 'retweet': 'avg_retweet_read', 
+                                             'quote': 'avg_quote_read', 'like': 'avg_like_read'})
+    df = df.reset_index(drop=True)
+    _cols = ['avg_reply_read', 'avg_retweet_read', 'avg_quote_read', 'avg_like_read', 'READ_count_user_id']
+    df[_cols] = pd.merge(df[['READ_user_id']], read_merge, on='READ_user_id', how='left').fillna(0)[_cols]
+    
+    del read_merge, _cols
+    
+    print('Read done')
+
+    return df
+
+
+def merge_type_pop(df):
+
+    auth_merge = pd.read_csv('auth_tt_merge_div.csv').rename(columns = {'is_cT':'is_aT', 'is_cR':'is_aR', 'is_cQ':'is_aQ'})
+    df = df.reset_index(drop=True)
+    _cols = ['rep_aT', 'ret_aT', 'quo_aT', 'lik_aT', 'rep_aR', 'ret_aR', 'quo_aR', 'lik_aR', 'rep_aQ', 'ret_aQ', 'quo_aQ', 'lik_aQ', 'is_aT', 'is_aR', 'is_aQ']
+    df[_cols] = pd.merge(df[['AUTH_user_id']], auth_merge, on='AUTH_user_id', how='left').fillna(0)[_cols]
+    del auth_merge, _cols
+    print("Auth type done")
+
+    read_merge = pd.read_csv('read_tt_merge_div.csv').rename(columns = {'is_cT': 'is_aT', 'is_cR': 'is_aR', 'is_cQ': 'is_aQ'})
+    _cols_old = ['rep_aT', 'ret_aT', 'quo_aT', 'lik_aT', 'rep_aR', 'ret_aR', 'quo_aR', 'lik_aR', 'rep_aQ', 'ret_aQ', 'quo_aQ', 'lik_aQ', 'is_aT', 'is_aR', 'is_aQ']
+    _cols = [c+'_read' for c in _cols_old]
+    read_merge = read_merge.rename(columns=dict(zip(_cols_old, _cols)))
+    df = df.reset_index(drop=True)
+    df[_cols] = pd.merge(df[['READ_user_id']], read_merge, on='READ_user_id', how='left').fillna(0)[_cols]
+    del read_merge, _cols_old, _cols
+
+    print('Read type done')
+    return df
+
+
+def merge_followers(df):
+    
+    rm = pd.read_csv('AUTH_follower_count.csv')
+    df = pd.merge(df, rm, on='AUTH_user_id', how='left')
+    df['AUTH_follower_count'] = df['AUTH_follower_count_y'].fillna(df['AUTH_follower_count_x'])
+    df['AUTH_following_count'] = df['AUTH_following_count_y'].fillna(df['AUTH_following_count_x'])
+    df = df.drop(columns=['AUTH_follower_count_x', 'AUTH_follower_count_y', 'AUTH_following_count_x', 'AUTH_following_count_y'])
+    del rm
+    print('Auth follower done')
+
+    rm = pd.read_csv('READ_follower_count.csv')
+    df = pd.merge(df, rm, on='READ_user_id', how='left')
+    df['READ_follower_count'] = df['READ_follower_count_y'].fillna(df['READ_follower_count_x'])
+    df['READ_following_count'] = df['READ_following_count_y'].fillna(df['READ_following_count_x'])
+    df = df.drop(columns=['READ_follower_count_x', 'READ_follower_count_y', 'READ_following_count_x', 'READ_following_count_y'])
+    del rm
+    print('Read follower done')
+    
+    return df
+
+
+def smooth_pops(dfd):
+    _means = json.load(open('means.json', 'r'))
+
+    K=10
+
+    for prob in ['avg_reply', 'avg_retweet', 'avg_quote', 'avg_like', 
+            'avg_reply_read', 'avg_retweet_read', 'avg_quote_read', 'avg_like_read',
+            'rep_aT', 'ret_aT', 'quo_aT', 'lik_aT', 'rep_aR', 'ret_aR', 'quo_aR', 'lik_aR', 'rep_aQ', 'ret_aQ', 'quo_aQ', 'lik_aQ',
+            'rep_aT_read', 'ret_aT_read', 'quo_aT_read', 'lik_aT_read', 'rep_aR_read', 'ret_aR_read', 'quo_aR_read', 'lik_aR_read', 'rep_aQ_read', 'ret_aQ_read', 'quo_aQ_read', 'lik_aQ_read']:
+    
+        dfd['a_count'] = dfd['is_aT']+dfd['is_aR']+dfd['is_aQ']
+        dfd['r_count'] = dfd['is_aT_read'] + dfd['is_aR_read'] + dfd['is_aQ_read']
+    
+        if 'lik' in prob:
+            mn = _means['like']
+        if 'ret' in prob:
+            mn = _means['retweet']
+        if 'quo' in prob:
+            mn = _means['quote']
+        if 'rep' in prob:
+            mn = _means['reply']
+    
+        if 'avg' in prob:
+            if 'read' in prob:
+                dfd[prob] = ((dfd[prob] * dfd['r_count']) + (mn * K)) / (K + dfd['r_count'])
+            else:
+                dfd[prob] = ((dfd[prob] * dfd['a_count']) + (mn * K)) / (K + dfd['a_count'])    
+        else:
+            if 'aT' in prob:
+                if 'read' in prob:
+                    dfd[prob] = ((dfd[prob] * dfd['is_aT_read']) + (mn * K)) / (K + dfd['is_aT_read'])
+                else:
+                    dfd[prob] = ((dfd[prob] * dfd['is_aT']) + (mn * K)) / (K + dfd['is_aT'])
+            
+            elif 'aR' in prob:
+                if 'read' in prob:
+                    dfd[prob] = ((dfd[prob] * dfd['is_aR_read']) + (mn * K)) / (K + dfd['is_aR_read'])
+                else:
+                    dfd[prob] = ((dfd[prob] * dfd['is_aR']) + (mn * K)) / (K + dfd['is_aR'])
+            
+            else:
+                if 'read' in prob:
+                    dfd[prob] = ((dfd[prob] * dfd['is_aQ_read']) + (mn * K)) / (K + dfd['is_aQ_read'])
+                else:
+                    dfd[prob] = ((dfd[prob] * dfd['is_aQ']) + (mn * K)) / (K + dfd['is_aQ'])
+
+    return dfd
+    
+
+def check_features(boost_features, features):
+    if boost_features == features:
+        return 
+    
+    print(' DF Features:', features)
+    print()
+    print('BST Features:', boost_features)
+    print()
+
+
+def create_quantiles(df):
+    # Quantile group
+    #df['bin'] = pd.qcut(df.AUTH_follower_count, 5, labels=[0,1,2,3,4])
+    qs = [-np.inf, 240, 588, 1331, 3996, np.inf]
+    df['bin'] = pd.cut(df.AUTH_follower_count, qs, labels=[0,1,2,3,4])
+    return df
+
+
+def fill_predict(df, features, chain_predict=False, bin_predict=False):
+    """
+    # OPTION 1: Combine two models
+    df['reply'] = 0
+    df['retweet'] = 0
+    df['quote'] = 0
+    df['like'] = 0
+    
+    tv = 4         # Threshold value for READ or AUTH minimum appearances
+    nlast = 10     # Features to discard for the non-popularity model
+
+    df.loc[(df.READ_count_user_id < tv) & (df.AUTH_count_user_id < tv), 'reply'] = lgb.Booster(model_file='reply_bst_np.lgb').predict(df.loc[(df.READ_count_user_id < tv) & (df.AUTH_count_user_id < tv), features[:-nlast]])
+    df.loc[(df.READ_count_user_id < tv) & (df.AUTH_count_user_id < tv), 'retweet'] = lgb.Booster(model_file='retweet_bst_np.lgb').predict(df.loc[(df.READ_count_user_id < tv) & (df.AUTH_count_user_id < tv), features[:-nlast]])
+    df.loc[(df.READ_count_user_id < tv) & (df.AUTH_count_user_id < tv), 'quote'] = lgb.Booster(model_file='quote_bst_np.lgb').predict(df.loc[(df.READ_count_user_id < tv) & (df.AUTH_count_user_id < tv), features[:-nlast]])
+    df.loc[(df.READ_count_user_id < tv) & (df.AUTH_count_user_id < tv), 'like'] = lgb.Booster(model_file='like_bst_np.lgb').predict(df.loc[(df.READ_count_user_id < tv) & (df.AUTH_count_user_id < tv), features[:-nlast]])
+
+    df.loc[~((df.READ_count_user_id < tv) & (df.AUTH_count_user_id < tv)), 'reply'] = lgb.Booster(model_file='reply_bst.lgb').predict(df.loc[~((df.READ_count_user_id < tv) & (df.AUTH_count_user_id < tv)), features])
+    df.loc[~((df.READ_count_user_id < tv) & (df.AUTH_count_user_id < tv)), 'retweet'] = lgb.Booster(model_file='retweet_bst.lgb').predict(df.loc[~((df.READ_count_user_id < tv) & (df.AUTH_count_user_id < tv)), features])
+    df.loc[~((df.READ_count_user_id < tv) & (df.AUTH_count_user_id < tv)), 'quote'] = lgb.Booster(model_file='quote_bst.lgb').predict(df.loc[~((df.READ_count_user_id < tv) & (df.AUTH_count_user_id < tv)), features])
+    df.loc[~((df.READ_count_user_id < tv) & (df.AUTH_count_user_id < tv)), 'like'] = lgb.Booster(model_file='like_bst.lgb').predict(df.loc[~((df.READ_count_user_id < tv) & (df.AUTH_count_user_id < tv)), features])
+
+    """
+
+    """
+    # OPTION 2: Predict using only one model. Print features if they are not the same
+
+    first_boost = lgb.Booster(model_file='like_bst.lgb')
+    check_features(first_boost.feature_name(), features)
+
+    df['like_timestamp'] = lgb.Booster(model_file='like_bst.lgb').predict(df.loc[:, features])
+    if chain_predict: 
+        features = features + ['like_timestamp']
+
+    df['retweet_timestamp'] = lgb.Booster(model_file='retweet_bst.lgb').predict(df.loc[:, features])
+    if chain_predict:
+        features = features + ['retweet_timestamp']
+
+    df['reply_timestamp'] = lgb.Booster(model_file='reply_bst.lgb').predict(df.loc[:, features])
+    if chain_predict:
+        features = features + ['reply_timestamp']
+
+    df['quote_timestamp'] = lgb.Booster(model_file='quote_bst.lgb').predict(df.loc[:, features])
+    df = df.rename(columns = {t+'_timestamp': t for t in ['like', 'retweet', 'reply', 'quote']})
+    """
+
+    """
+    # OPTION 3: Merge models
+
+    first_boost = lgb.Booster(model_file='like_bst_part1.lgb')
+    check_features(first_boost.feature_name(), features)  
+    
+    weights = [0.5, 0.5, 0.2, 0.2, 0.2]
+    num_models = 2
+
+    df['like_timestamp'] = np.sum([weights[p-1] * lgb.Booster(model_file=f'like_bst_part{p}.lgb').predict(df.loc[:, features]) for p in range(1, num_models+1)], axis=0)
+    if chain_predict: 
+        features = features + ['like_timestamp']
+    print('+ Like predicted')
+
+    df['retweet_timestamp'] = np.sum([weights[p-1] * lgb.Booster(model_file=f'retweet_bst_part{p}.lgb').predict(df.loc[:, features]) for p in range(1, num_models+1)], axis=0)
+    if chain_predict:
+        features = features + ['retweet_timestamp']
+    print('+ Retweet predicted')
+
+    df['reply_timestamp'] = np.sum([weights[p-1] * lgb.Booster(model_file=f'reply_bst_part{p}.lgb').predict(df.loc[:, features]) for p in range(1, num_models+1)], axis=0)
+    if chain_predict:
+        features = features + ['reply_timestamp']
+    print('+ Reply predicted')
+
+    df['quote_timestamp'] = np.sum([weights[p-1] * lgb.Booster(model_file=f'quote_bst_part{p}.lgb').predict(df.loc[:, features]) for p in range(1, num_models+1)], axis=0)
+    print('+ Quote predicted')
+
+    df = df.rename(columns = {t+'_timestamp': t for t in ['like', 'retweet', 'reply', 'quote']})
+    """
+       
+    """
+    first_boost = lgb.Booster(model_file='like_bst.lgb')
+    check_features(first_boost.feature_name(), features)
+
+    df = create_quantiles(df)
+
+    # Like
+    if bin_predict:
+        df.loc[df.bin==0, 'like_timestamp'] = lgb.Booster(model_file='like_bst.lgb').predict(df.loc[df.bin==0, features])
+        df.loc[df.bin>0, 'like_timestamp'] = lgb.Booster(model_file='like_bst_bin.lgb').predict(df.loc[df.bin>0, features])
+    else:
+        df['like_timestamp'] = lgb.Booster(model_file='like_bst.lgb').predict(df.loc[:, features])        
+    if chain_predict: 
+        features = features + ['like_timestamp']
+    print(' + Like')
+
+    # Retweet
+    if bin_predict:
+        df.loc[df.bin==0, 'retweet_timestamp'] = lgb.Booster(model_file='retweet_bst.lgb').predict(df.loc[df.bin==0, features])
+        df.loc[df.bin>0, 'retweet_timestamp'] = lgb.Booster(model_file='retweet_bst_bin.lgb').predict(df.loc[df.bin>0, features])
+    else:
+        df['retweet_timestamp'] = lgb.Booster(model_file='retweet_bst.lgb').predict(df.loc[:, features])
+    if chain_predict:
+        features = features + ['retweet_timestamp']
+    print(' + Retweet')
+
+    # Reply
+    if bin_predict:
+        df.loc[df.bin==0, 'reply_timestamp'] = lgb.Booster(model_file='reply_bst.lgb').predict(df.loc[df.bin==0, features])
+        df.loc[df.bin>0, 'reply_timestamp'] = lgb.Booster(model_file='reply_bst_bin.lgb').predict(df.loc[df.bin>0, features])
+    else:
+        df['reply_timestamp'] = lgb.Booster(model_file='reply_bst.lgb').predict(df.loc[:, features])
+    if chain_predict:
+        features = features + ['reply_timestamp']
+    print(' + Reply')
+
+    # Quote
+    if bin_predict:
+        df.loc[df.bin==0, 'quote_timestamp'] = lgb.Booster(model_file='quote_bst.lgb').predict(df.loc[df.bin==0, features])
+        df.loc[df.bin>0, 'quote_timestamp'] = lgb.Booster(model_file='quote_bst_bin.lgb').predict(df.loc[df.bin>0, features])
+    else:
+        df['quote_timestamp'] = lgb.Booster(model_file='quote_bst.lgb').predict(df.loc[:, features])
+    print(' + Quote')
+    """
+
+
+
+    #first_boost = lgb.Booster(model_file='like_bst.lgb')
+    #check_features(first_boost.feature_name(), features)
+
+    f1 = ['AUTH_follower_count', 'AUTH_following_count', 'READ_follower_count', 'READ_following_count', 'f01_num_hashtags', 'f02_AUTH_verified', 'f03_READ_verified', 'f04_auth_follows_read', 'f05_bert_length', 'f06_num_media', 'f07_num_domains', 'f08_ratio1', 'f09_ratio2', 'f10_ratio3', 'f11_ratio4', 'f12_photo', 'f13_video', 'f14_GIF', 'f15_type', 'f16_hour', 'f17_num_links', 'f18_language', 'f19_weekday', 'f20_auth_creat_year', 'f21_read_creat_year', 'f22_diff_creat_year', 'f23_at_bert', 'f24_rt_at_bert', 'f25_unk', 'f26_unk_ratio', 'f27_tok1', 'f28_tok2', 'f29_tok3', 'f30_tok4', 'f31_question', 'avg_reply', 'avg_retweet', 'avg_quote', 'avg_like', 'avg_reply_read', 'avg_retweet_read', 'avg_quote_read', 'avg_like_read', 'rep_aT', 'ret_aT', 'quo_aT', 'lik_aT', 'rep_aR', 'ret_aR', 'quo_aR', 'lik_aR', 'rep_aQ', 'ret_aQ', 'quo_aQ', 'lik_aQ', 'rep_aT_read', 'ret_aT_read', 'quo_aT_read', 'lik_aT_read', 'rep_aR_read', 'ret_aR_read', 'quo_aR_read', 'lik_aR_read', 'rep_aQ_read', 'ret_aQ_read', 'quo_aQ_read', 'lik_aQ_read', 'a_count', 'r_count'] 
+    f2 = ['AUTH_follower_count', 'AUTH_following_count', 'READ_follower_count', 'READ_following_count', 'f01_num_hashtags', 'f02_AUTH_verified', 'f03_READ_verified', 'f04_auth_follows_read', 'f05_bert_length', 'f06_num_media', 'f07_num_domains', 'f08_ratio1', 'f09_ratio2', 'f10_ratio3', 'f11_ratio4', 'f12_photo', 'f13_video', 'f14_GIF', 'f15_type', 'f16_hour', 'f17_num_links', 'f18_language', 'f19_weekday', 'f20_auth_creat_year', 'f21_read_creat_year', 'f22_diff_creat_year', 'f23_at_bert', 'f24_rt_at_bert', 'f25_unk', 'f26_unk_ratio', 'f27_tok1', 'f28_tok2', 'f29_tok3', 'f30_tok4', 'f31_question', 'avg_reply_read', 'avg_retweet_read', 'avg_quote_read', 'avg_like_read', 'rep_aT_read', 'ret_aT_read', 'quo_aT_read', 'lik_aT_read', 'rep_aR_read', 'ret_aR_read', 'quo_aR_read', 'lik_aR_read', 'rep_aQ_read', 'ret_aQ_read', 'quo_aQ_read', 'lik_aQ_read', 'a_count', 'r_count']
+
+    
+    check_features(lgb.Booster(model_file='like_bst_cs.lgb').feature_name(), f2)
+    check_features(lgb.Booster(model_file='like_bst.lgb').feature_name(), f1)
+
+    #print(len(df.select_dtypes(exclude=['number', 'bool_', 'object_'])), df.select_dtypes(exclude=['number', 'bool_', 'object_']))
+
+
+    # Like
+    df.loc[df.a_count<5, 'like_timestamp'] = lgb.Booster(model_file='like_bst_cs.lgb').predict(df.loc[df.a_count<5, f2])        
+    df.loc[df.a_count>=5, 'like_timestamp'] = lgb.Booster(model_file='like_bst.lgb').predict(df.loc[df.a_count>=5, f1])        
+    if chain_predict: 
+        features = features + ['like_timestamp']
+    print(' + Like')
+
+    df.loc[df.a_count<5, 'retweet_timestamp'] = lgb.Booster(model_file='retweet_bst_cs.lgb').predict(df.loc[df.a_count<5, f2 + ['like_timestamp']])        
+    df.loc[df.a_count>=5, 'retweet_timestamp'] = lgb.Booster(model_file='retweet_bst.lgb').predict(df.loc[df.a_count>=5, f1 + ['like_timestamp']])        
+    if chain_predict: 
+        features = features + ['retweet_timestamp']
+    print(' + Like')
+
+    df.loc[df.a_count<5, 'reply_timestamp'] = lgb.Booster(model_file='reply_bst_cs.lgb').predict(df.loc[df.a_count<5, f2 + ['like_timestamp', 'retweet_timestamp']])        
+    df.loc[df.a_count>=5, 'reply_timestamp'] = lgb.Booster(model_file='reply_bst.lgb').predict(df.loc[df.a_count>=5, f1 + ['like_timestamp', 'retweet_timestamp']])        
+    if chain_predict: 
+        features = features + ['reply_timestamp']
+    print(' + Like')
+
+    df.loc[df.a_count<5, 'quote_timestamp'] = lgb.Booster(model_file='quote_bst_cs.lgb').predict(df.loc[df.a_count<5, f2 + ['like_timestamp','retweet_timestamp','reply_timestamp']])        
+    df.loc[df.a_count>=5, 'quote_timestamp'] = lgb.Booster(model_file='quote_bst.lgb').predict(df.loc[df.a_count>=5, f1 + ['like_timestamp','retweet_timestamp','reply_timestamp']])        
+    if chain_predict: 
+        features = features + ['quote_timestamp']
+    print(' + Like')
+
+    df = df.rename(columns = {t+'_timestamp': t for t in ['like', 'retweet', 'reply', 'quote']})
+    
+    return df
+
+
+
+def evaluate_test_set():
+    
+    # Week to test 
+    testid = '4' #'4' # '3'
+
+    # Params for prediction
+    bin_predict = False
+    chain_predict = True
+
+    # Read
+    
+    if not os.path.exists(f'test_{testid}'):
+        df = dd.read_csv(f'test/part-*', names=list(column_type.keys()), header=None, sep='\x01', dtype=column_type)
+    else:
+        df = dd.read_csv(f'test_{testid}/part-*', names=list(column_type.keys()), header=None, sep='\x01', dtype=column_type)
+    
+    print(f'Starting... Using week {testid} for test')
+
+    # Create basic features and save its names
+    df = basic_features(df)    
+    
+    features = ['AUTH_follower_count', 'AUTH_following_count', 'READ_follower_count', 'READ_following_count']
+    features = features + [col for col in df.columns if col[1:3] in [f'{i:02d}' for i in range(1, 100)]]
+    
+    # Compute the dataset. Merges and concats with dask can bring problems
+    df = df.loc[:, ['bert','tweet_id', 'AUTH_user_id', 'READ_user_id']+features].compute()
+    
+    # Text features
+    df = text_features(df)
+
+    features = ['AUTH_follower_count', 'AUTH_following_count', 'READ_follower_count', 'READ_following_count']
+    features = features + sorted([col for col in df.columns if col[1:3] in [f'{i:02d}' for i in range(1, 100)]])
+
+    # Compute logcounts appearances log10(appearances)
+    # df = merge_logcounts(df)
+    # features = features + ['f25_auth_log_count', 'f26_read_log_count']
+
+    print('Compute completed')
+
+    # Merge the popularity as 8 new columns
+    df = merge_popularity(df)
+    features = features + ['avg_reply', 'avg_retweet', 'avg_quote', 'avg_like']
+    features = features + ['avg_reply_read', 'avg_retweet_read', 'avg_quote_read', 'avg_like_read']
+
+    df = merge_type_pop(df)
+    tp = ['rep_aT', 'ret_aT', 'quo_aT', 'lik_aT', 'rep_aR', 'ret_aR', 'quo_aR', 'lik_aR', 'rep_aQ', 'ret_aQ', 'quo_aQ', 'lik_aQ']
+    features = features + tp
+    features = features + [t+'_read' for t in tp]
+    features = features + ['a_count', 'r_count']   
+    # df = merge_followers(df)
+
+    df = smooth_pops(df)
+
+    # Fill new columns with predictions and save to csv
+    df = fill_predict(df, features, chain_predict=chain_predict, bin_predict=bin_predict)
+    df[['tweet_id', 'READ_user_id', 'reply', 'retweet', 'quote', 'like']].to_csv('results.csv', index=False, header=False)
+
+    print('Results generated')
+    print()
+    
+    ###################################################################################################################################################################################
+
+    if not os.path.exists(f'reals_{testid}.csv'):
+        return
+    
+    # Local test. Read reals and check score
+    reals = pd.read_csv(f'reals_{testid}.csv', header=None, names=['reply', 'retweet', 'quote', 'like'])
+    
+    df = create_quantiles(df)
+
+    df = df.reset_index()
+    
+    vals = []
+    for col in ['reply', 'retweet', 'quote', 'like']:
+        
+        rce_dct, ap_dct = {}, {}
+
+        # For each bin, compute rce and ap
+        for i in range(5):
+            preds_i = df[df.bin==i][col].values
+            gt_i = reals.loc[df.bin==i][col].values
+
+            rce_dct[i] = np.round(compute_rce(preds_i, gt_i), 4)
+            ap_dct[i] = np.round(average_precision_score(gt_i, preds_i), 4)
+
+        rce = np.mean(list(rce_dct.values()))
+        average_precision = np.mean(list(ap_dct.values()))
+
+        old_rce = compute_rce(df[col], reals[col])
+        old_ap = average_precision_score(reals[col], df[col])
+
+        print(f'{col}')
+        print('='*31)
+        print(f'OLD_AP: {old_ap:.4f} OLD_RCE: {old_rce:.4f}')
+        print(f'    AP: {average_precision:.4f}     RCE: {rce:.4f}')
+        print('RCE Groups:',rce_dct.items())
+        print(' AP Groups:', ap_dct.items())
+        print()
+        
+        vals.append((average_precision, rce))
+    print(f'Leaderboard')
+    print(f'{vals[1][0]:.4f} {vals[1][1]:.4f} {vals[0][0]:.4f} {vals[0][1]:.4f} {vals[3][0]:.4f} {vals[3][1]:.4f} {vals[2][0]:.4f} {vals[2][1]:.4f}')
+    print()
+
+
+if __name__ == "__main__":
+    evaluate_test_set()
